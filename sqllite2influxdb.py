@@ -133,38 +133,55 @@ def batch_insert_to_influx(client, rows):
         attributes_json = parse_attributes(shared_attrs)
 
         friendly_name = attributes_json.get('friendly_name', entity_id_short)
-        unit_of_measurement = attributes_json.get('unit_of_measurement', 'default_measurement')
+        unit_of_measurement = attributes_json.get('unit_of_measurement')
 
-        if unit_of_measurement == '':
-            unit_of_measurement = 'count'
+        if not unit_of_measurement:
+            logging.debug(f"Skipping entity '{entity_id}' — no unit_of_measurement in attributes")
+            continue
+
         try:
             # Convert timestamp from Unix epoch to UTC-aware datetime object
             last_updated_dt = datetime.fromtimestamp(float(last_updated_ts), tz=timezone.utc)
             # Create an InfluxDB point with tags and fields
             point = Point(unit_of_measurement).tag("source", "HA").tag("domain", domain)
-            point.tag("entity_id", entity_id_short).tag("friendly_name", friendly_name).time(last_updated_dt)
+            point.tag("entity_id", entity_id_short).time(last_updated_dt)
 
             # Add the state value as either a numerical value or a string
-            if isinstance(state, (int, float)) or (isinstance(state, str) and state.replace('.', '', 1).isdigit()):
-                point.field("value", float(state))
-            else:
+            try:
+                # Attempt to convert state to a float.
+                val = float(state)
+                point.field("value", val)
+            except (ValueError, TypeError):
+                # If it's not a number (ValueError) or not a string/number (TypeError),
+                # we treat it as a string state.
                 point.field("state", str(state))
 
             # Add additional attributes as fields, ensuring correct type
             for key, value in attributes_json.items():
-                if key in ["id", "id_str", "update_available"]:
+                if key in ["id", "id_str", "update_available", "entity_id", "icon", "last_reset"]:
+                    continue
+                if value is None:
                     continue
                 try:
                     if key in ["temperature", "humidity", "voc", "formaldehyd", "co2", "linkquality"]:
                         point.field(key, float(value))
                     elif isinstance(value, (int, float)) or (isinstance(value, str) and value.replace('.', '', 1).isdigit()):
                         point.field(key, float(value))
+                    elif isinstance(value, str):
+                        point.field(f"{key}_str", str(value))
                     else:
                         point.field(f"{key}", str(value))
                 except Exception as e:
                     logging.warning(f"Skipping field '{key}' for entity '{entity_id}' with value '{value}' due to type conflict: {e}")
 
             points.append(point)
+            logging.debug(
+                f"Queued point → table='{unit_of_measurement}' "
+                f"entity='{entity_id}' "
+                f"value={state!r} "
+                f"time={last_updated_dt.isoformat()}"
+            )
+            logging.debug(point)
 
         except ValueError as e:
             logging.warning(f"Error preparing InfluxDB point for entity {entity_id}: {e}, row: {row}")
