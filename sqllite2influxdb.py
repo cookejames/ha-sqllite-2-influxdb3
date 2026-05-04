@@ -1,8 +1,7 @@
 import sqlite3
 import json
-from datetime import datetime
-from influxdb_client import InfluxDBClient, Point
-from influxdb_client.client.write_api import SYNCHRONOUS
+from datetime import datetime, timezone
+from influxdb_client_3 import InfluxDBClient3, Point
 from dotenv import load_dotenv
 import logging
 import os
@@ -12,6 +11,7 @@ load_dotenv()
 
 # Setup logging
 DEBUG_MODE = os.getenv("DEBUG_MODE", "false").lower() == "true"
+DRY_RUN = os.getenv("DRY_RUN", "false").lower() == "true"
 logging_level = logging.DEBUG if DEBUG_MODE else logging.INFO
 logging.basicConfig(level=logging_level, format='%(asctime)s - %(levelname)s - %(message)s')
 
@@ -19,14 +19,17 @@ logging.basicConfig(level=logging_level, format='%(asctime)s - %(levelname)s - %
 sqlite_db = os.getenv("SQLITE_DB")
 influx_url = os.getenv("INFLUXDB_URL")
 influx_token = os.getenv("INFLUXDB_TOKEN")
-influx_org = os.getenv("INFLUXDB_ORG")
-influx_bucket = os.getenv("INFLUXDB_BUCKET")
+influx_database = os.getenv("INFLUXDB_DATABASE")  # replaces INFLUXDB_ORG + INFLUXDB_BUCKET
 
 # Validate environment variables
-required_env_vars = [sqlite_db, influx_url, influx_token, influx_org, influx_bucket]
+# In dry run mode the InfluxDB connection vars are not required
+required_env_vars = [sqlite_db, influx_url, influx_token, influx_database]
 if any(v is None for v in required_env_vars):
     logging.error("One or more required environment variables are not set.")
     exit(1)
+
+if DRY_RUN:
+    logging.info("*** DRY RUN MODE — no data will be written to InfluxDB ***")
 
 BATCH_SIZE = int(os.getenv("BATCH_SIZE", 10000))
 
@@ -41,29 +44,49 @@ def connect_to_sqlite(db_path):
         logging.error(f"SQLite error: {e}")
         exit(1)
 
-def connect_to_influxdb(url, token, org):
+def connect_to_influxdb(url, token, database):
     try:
-        # Connect to InfluxDB and return the client write and query APIs
-        client = InfluxDBClient(url=url, token=token, org=org)
-        logging.info("Successfully connected to InfluxDB")
-        return client.write_api(write_options=SYNCHRONOUS), client.query_api()
+        # Connect to InfluxDB 3 - host should be just the hostname/base URL without trailing slash
+        # InfluxDB 3 uses 'database' instead of 'org'+'bucket'
+        client = InfluxDBClient3(host=url, token=token, database=database)
+        logging.info("Successfully connected to InfluxDB 3")
+        return client
     except Exception as e:
         logging.error(f"InfluxDB connection error: {e}")
         exit(1)
 
-def get_oldest_influx_timestamp(query_api):
+def get_oldest_influx_timestamp(client):
     try:
-        # Query InfluxDB for the oldest timestamp in the specified bucket
-        query_string = f'''
-        from(bucket: "{influx_bucket}")
-          |> range(start: 0)
-          |> filter(fn: (r) => r["_measurement"] == "units")
-          |> sort(columns: ["_time"], desc: false)
-          |> limit(n: 1)
-        '''
-        result = query_api.query(org=influx_org, query=query_string)
-        if result and len(result) > 0 and len(result[0].records) > 0:
-            return result[0].records[0].get_time().isoformat()
+        # Discover all measurements in the database
+        measurements_table = client.query(query="SHOW MEASUREMENTS", language="influxql")
+        if measurements_table is None or measurements_table.num_rows == 0:
+            logging.info("No measurements found in InfluxDB database.")
+            return None
+
+        # SHOW MEASUREMENTS returns a 'name' column
+        measurement_names = [row.as_py() for row in measurements_table.column("name")]
+        logging.info(f"Found {len(measurement_names)} measurement(s) in InfluxDB: {measurement_names}")
+
+        oldest_ts = None
+        for measurement in measurement_names:
+            try:
+                table = client.query(
+                    query=f'SELECT * FROM "{measurement}" ORDER BY time ASC LIMIT 1',
+                    language="influxql"
+                )
+                if table is not None and table.num_rows > 0:
+                    time_col = table.column("time")
+                    if time_col and len(time_col) > 0:
+                        ts = time_col[0].as_py()
+                        if ts is not None:
+                            if oldest_ts is None or ts < oldest_ts:
+                                oldest_ts = ts
+                                logging.debug(f"New oldest timestamp {ts} from measurement '{measurement}'")
+            except Exception as e:
+                logging.warning(f"Could not query measurement '{measurement}': {e}")
+
+        return oldest_ts.isoformat() if oldest_ts is not None else None
+
     except Exception as e:
         logging.error(f"Error querying InfluxDB for the oldest timestamp: {e}")
     return None
@@ -71,7 +94,10 @@ def get_oldest_influx_timestamp(query_api):
 def format_timestamp(oldest_timestamp):
     try:
         # Convert ISO format timestamp to a string format compatible with SQLite
-        dt_obj = datetime.fromisoformat(oldest_timestamp.replace('Z', ''))
+        if isinstance(oldest_timestamp, str):
+            dt_obj = datetime.fromisoformat(oldest_timestamp.replace('Z', '+00:00'))
+        else:
+            dt_obj = oldest_timestamp
         return dt_obj.strftime("%Y-%m-%d %H:%M:%S")
     except ValueError as e:
         logging.error(f"Error parsing timestamp: {e}")
@@ -97,7 +123,7 @@ def parse_attributes(shared_attrs):
         logging.warning(f"Failed to parse attributes: {e}")
         return {}
 
-def batch_insert_to_influx(write_api, rows):
+def batch_insert_to_influx(client, rows):
     points = []
     for row in rows:
         state, entity_id, last_updated_ts, shared_attrs = row
@@ -112,8 +138,8 @@ def batch_insert_to_influx(write_api, rows):
         if unit_of_measurement == '':
             unit_of_measurement = 'count'
         try:
-            # Convert timestamp from Unix epoch to datetime object
-            last_updated_dt = datetime.fromtimestamp(float(last_updated_ts))
+            # Convert timestamp from Unix epoch to UTC-aware datetime object
+            last_updated_dt = datetime.fromtimestamp(float(last_updated_ts), tz=timezone.utc)
             # Create an InfluxDB point with tags and fields
             point = Point(unit_of_measurement).tag("source", "HA").tag("domain", domain)
             point.tag("entity_id", entity_id_short).tag("friendly_name", friendly_name).time(last_updated_dt)
@@ -144,16 +170,20 @@ def batch_insert_to_influx(write_api, rows):
             logging.warning(f"Error preparing InfluxDB point for entity {entity_id}: {e}, row: {row}")
 
     if points:
-        # Write points to InfluxDB, writing each point individually in DEBUG mode
-        if DEBUG_MODE:
+        if DRY_RUN:
+            # Dry run: print each point's line protocol instead of writing
+            for point in points:
+                print(point.to_line_protocol())
+        elif DEBUG_MODE:
+            # Debug mode: write one point at a time for easier error tracing
             for point in points:
                 try:
-                    write_api.write(bucket=influx_bucket, org=influx_org, record=point)
+                    client.write(record=point)
                 except Exception as e:
                     logging.error(f"Error writing point to InfluxDB: {e}. Point: {point}")
         else:
             try:
-                write_api.write(bucket=influx_bucket, org=influx_org, record=points)
+                client.write(record=points)
                 logging.info(f"Successfully wrote {len(points)} points to InfluxDB")
             except Exception as e:
                 logging.error(f"Error writing points to InfluxDB: {e}")
@@ -163,10 +193,10 @@ def batch_insert_to_influx(write_api, rows):
 def main():
     # Main execution flow
     conn, cursor = connect_to_sqlite(sqlite_db)
-    write_api, query_api = connect_to_influxdb(influx_url, influx_token, influx_org)
+    client = connect_to_influxdb(influx_url, influx_token, influx_database)
 
     # Get the oldest timestamp from InfluxDB to determine how much data to process
-    oldest_influx_timestamp = get_oldest_influx_timestamp(query_api)
+    oldest_influx_timestamp = get_oldest_influx_timestamp(client)
     logging.info(f"Oldest InfluxDB timestamp: {oldest_influx_timestamp}")
 
     # Format the timestamp for SQLite and build the query
@@ -174,29 +204,35 @@ def main():
     sqlite_query = build_sqlite_query(formatted_timestamp)
     logging.info(f"Final SQLite query: {sqlite_query}")
 
+    total_points = 0
     try:
         # Execute the SQLite query and process rows in batches
-        logging.info(f"Fetching Data from SQLite.")
+        logging.info("Fetching Data from SQLite.")
         cursor.execute(sqlite_query)
         rows_fetched = 0
-        logging.info(f"Started Processing Data from SQLite.")
+        logging.info("Started Processing Data from SQLite.")
         while True:
             rows = cursor.fetchmany(BATCH_SIZE)
             if not rows:
                 break
-            batch_insert_to_influx(write_api, rows)
+            batch_insert_to_influx(client, rows)
             rows_fetched += len(rows)
+            total_points += len(rows)
             # logging.info(f"Processed {rows_fetched} rows so far.")
     except sqlite3.Error as e:
         logging.error(f"SQLite query error: {e}")
     finally:
-        # Close all connections
+        # Close connections (client is None in dry run mode)
         cursor.close()
         conn.close()
-        write_api.close()
+        if client is not None:
+            client.close()
         logging.info("Closed connections to SQLite and InfluxDB")
 
-    logging.info("Data export complete.")
+    if DRY_RUN:
+        logging.info(f"Dry run complete — {total_points} rows would have been processed (skipped rows excluded from count).")
+    else:
+        logging.info("Data export complete.")
 
 if __name__ == "__main__":
     main()
