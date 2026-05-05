@@ -55,41 +55,7 @@ def connect_to_influxdb(url, token, database):
         logging.error(f"InfluxDB connection error: {e}")
         exit(1)
 
-def get_oldest_influx_timestamp(client):
-    try:
-        # Discover all measurements in the database
-        measurements_table = client.query(query="SHOW MEASUREMENTS", language="influxql")
-        if measurements_table is None or measurements_table.num_rows == 0:
-            logging.info("No measurements found in InfluxDB database.")
-            return None
 
-        # SHOW MEASUREMENTS returns a 'name' column
-        measurement_names = [row.as_py() for row in measurements_table.column("name")]
-        logging.info(f"Found {len(measurement_names)} measurement(s) in InfluxDB: {measurement_names}")
-
-        oldest_ts = None
-        for measurement in measurement_names:
-            try:
-                table = client.query(
-                    query=f'SELECT * FROM "{measurement}" ORDER BY time ASC LIMIT 1',
-                    language="influxql"
-                )
-                if table is not None and table.num_rows > 0:
-                    time_col = table.column("time")
-                    if time_col and len(time_col) > 0:
-                        ts = time_col[0].as_py()
-                        if ts is not None:
-                            if oldest_ts is None or ts < oldest_ts:
-                                oldest_ts = ts
-                                logging.debug(f"New oldest timestamp {ts} from measurement '{measurement}'")
-            except Exception as e:
-                logging.warning(f"Could not query measurement '{measurement}': {e}")
-
-        return oldest_ts.isoformat() if oldest_ts is not None else None
-
-    except Exception as e:
-        logging.error(f"Error querying InfluxDB for the oldest timestamp: {e}")
-    return None
 
 def format_timestamp(oldest_timestamp):
     try:
@@ -123,23 +89,29 @@ def parse_attributes(shared_attrs):
         logging.warning(f"Failed to parse attributes: {e}")
         return {}
 
-_entity_exists_cache = {}
+_entity_oldest_ts_cache = {}
 
-def check_entity_exists(client, measurement, domain, entity_id_short):
+def get_entity_oldest_timestamp(client, measurement, domain, entity_id_short):
     if client is None:
-        return True # For dry-run without client, assume exists
+        return datetime.now(timezone.utc) # For dry-run without client, assume very new to allow insert
     cache_key = f"{measurement}:{domain}:{entity_id_short}"
-    if cache_key in _entity_exists_cache:
-        return _entity_exists_cache[cache_key]
+    if cache_key in _entity_oldest_ts_cache:
+        return _entity_oldest_ts_cache[cache_key]
     try:
-        query = f'SELECT * FROM "{measurement}" WHERE "domain" = \'{domain}\' AND "entity_id" = \'{entity_id_short}\' LIMIT 1'
+        query = f'SELECT * FROM "{measurement}" WHERE "domain" = \'{domain}\' AND "entity_id" = \'{entity_id_short}\' ORDER BY time ASC LIMIT 1'
         table = client.query(query=query, language="influxql")
-        exists = table is not None and table.num_rows > 0
-        _entity_exists_cache[cache_key] = exists
-        return exists
+        if table is not None and table.num_rows > 0:
+            time_col = table.column("time")
+            if time_col and len(time_col) > 0:
+                ts = time_col[0].as_py()
+                _entity_oldest_ts_cache[cache_key] = ts
+                return ts
+        _entity_oldest_ts_cache[cache_key] = None
+        return None
     except Exception as e:
-        logging.warning(f"Error checking entity existence for {cache_key}: {e}")
-        return False
+        logging.warning(f"Error checking entity oldest timestamp for {cache_key}: {e}")
+        _entity_oldest_ts_cache[cache_key] = None
+        return None
 
 def batch_insert_to_influx(client, rows):
     points = []
@@ -157,13 +129,19 @@ def batch_insert_to_influx(client, rows):
             logging.debug(f"Skipping entity '{entity_id}' — no unit_of_measurement in attributes")
             continue
 
-        if not check_entity_exists(client, unit_of_measurement, domain, entity_id_short):
+        oldest_ts = get_entity_oldest_timestamp(client, unit_of_measurement, domain, entity_id_short)
+        if oldest_ts is None:
             logging.debug(f"Skipping entity '{entity_id}' — no existing data in table '{unit_of_measurement}'")
             continue
 
         try:
             # Convert timestamp from Unix epoch to UTC-aware datetime object
             last_updated_dt = datetime.fromtimestamp(float(last_updated_ts), tz=timezone.utc)
+            
+            if last_updated_dt >= oldest_ts:
+                logging.debug(f"Skipping entity '{entity_id}' — sqlite record time ({last_updated_dt.isoformat()}) is not older than InfluxDB oldest record ({oldest_ts.isoformat()})")
+                continue
+
             # Create an InfluxDB point with tags and fields
             point = Point(unit_of_measurement).tag("source", "HA").tag("domain", domain)
             point.tag("entity_id", entity_id_short).time(last_updated_dt)
@@ -234,13 +212,8 @@ def main():
     conn, cursor = connect_to_sqlite(sqlite_db)
     client = connect_to_influxdb(influx_url, influx_token, influx_database)
 
-    # Get the oldest timestamp from InfluxDB to determine how much data to process
-    oldest_influx_timestamp = get_oldest_influx_timestamp(client)
-    logging.info(f"Oldest InfluxDB timestamp: {oldest_influx_timestamp}")
-
-    # Format the timestamp for SQLite and build the query
-    formatted_timestamp = format_timestamp(oldest_influx_timestamp) if oldest_influx_timestamp else None
-    sqlite_query = build_sqlite_query(formatted_timestamp)
+    # Build the SQLite query (we no longer use a global oldest timestamp)
+    sqlite_query = build_sqlite_query(None)
     logging.info(f"Final SQLite query: {sqlite_query}")
 
     total_points = 0
