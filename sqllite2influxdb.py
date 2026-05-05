@@ -5,6 +5,7 @@ from influxdb_client_3 import InfluxDBClient3, Point
 from dotenv import load_dotenv
 import logging
 import os
+import time
 
 # Load environment variables
 load_dotenv()
@@ -21,6 +22,8 @@ sqlite_db = os.getenv("SQLITE_DB")
 influx_url = os.getenv("INFLUXDB_URL")
 influx_token = os.getenv("INFLUXDB_TOKEN")
 influx_database = os.getenv("INFLUXDB_DATABASE")  # replaces INFLUXDB_ORG + INFLUXDB_BUCKET
+BATCH_SIZE = int(os.getenv("BATCH_SIZE", 10000))
+DELAY_BETWEEN_ENTITIES = float(os.getenv("DELAY_BETWEEN_ENTITIES", 0.0))
 
 # Validate environment variables
 # In dry run mode the InfluxDB connection vars are not required
@@ -319,6 +322,9 @@ def main():
                 
             entities_to_process.append((entity_id, uom, oldest_ts))
 
+        # Sort entities by unit_of_measurement to group them nicely
+        entities_to_process.sort(key=lambda x: x[1])
+
         logging.info(f"Found {len(entities_to_process)} entities with existing InfluxDB records to process.")
 
         for entity_id, uom, oldest_ts in entities_to_process:
@@ -339,6 +345,10 @@ def main():
                 logging.info(f"Finished '{entity_id}' — States: {entity_states_points}, Statistics: {entity_statistics_points}")
             else:
                 logging.info(f"Finished '{entity_id}' — States: {entity_states_points}")
+
+            if DELAY_BETWEEN_ENTITIES > 0:
+                logging.debug(f"Sleeping for {DELAY_BETWEEN_ENTITIES} seconds before next entity...")
+                time.sleep(DELAY_BETWEEN_ENTITIES)
     except sqlite3.Error as e:
         logging.error(f"SQLite query error: {e}")
     finally:
