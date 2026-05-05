@@ -16,6 +16,7 @@ The script connects to both your Home Assistant SQLite database and your InfluxD
    - Measurements named like an entity ID (e.g. `sensor.living_room_temp`) are matched by `entity_id`.
    - Measurements named like a unit of measurement (e.g. `°C`, `%`, `kWh`) are matched by the `unit_of_measurement` attribute.
 4. Writes the historical rows into the corresponding InfluxDB measurement.
+5. If `IMPORT_STATISTICS_DATA=true`, it will also perform a second pass to import long-term data from the `statistics` table for each valid entity.
 
 This means the script safely backfills data without overwriting anything already in InfluxDB.
 
@@ -68,6 +69,7 @@ INFLUXDB_DATABASE=your_database
 BATCH_SIZE=10000
 DEBUG_MODE=false
 DRY_RUN=false
+IMPORT_STATISTICS_DATA=true
 ```
 
 ### Environment variable reference
@@ -81,6 +83,7 @@ DRY_RUN=false
 | `BATCH_SIZE` | ❌ | Rows processed per batch (default: `10000`) |
 | `DEBUG_MODE` | ❌ | Write points one-by-one for easier debugging (default: `false`) |
 | `DRY_RUN` | ❌ | Print line protocol to stdout instead of writing (default: `false`) |
+| `IMPORT_STATISTICS_DATA` | ❌ | Import long-term data from the Home Assistant `statistics` table (default: `false`) |
 
 ## Usage
 
@@ -112,8 +115,9 @@ DRY_RUN=true python3 sqllite2influxdb.py > preview.lp 2>run.log
 | Query language | Flux | InfluxQL |
 | Client library | `influxdb-client` | `influxdb3-python` |
 | Config | `INFLUXDB_ORG` + `INFLUXDB_BUCKET` | `INFLUXDB_DATABASE` |
-| Import strategy | Single pass, oldest global timestamp | Per-measurement, targeted SQLite queries |
+| Import strategy | Single pass, oldest global timestamp | Per-entity grouping, targeted SQLite queries |
 | Dry run | ❌ | ✅ |
+| Long-term Statistics | ❌ | ✅ (Optional) |
 
 ## License
 
