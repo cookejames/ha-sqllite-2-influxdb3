@@ -112,8 +112,8 @@ def build_sqlite_query(formatted_timestamp):
     JOIN states_meta sm ON sm.metadata_id = s.metadata_id
     """
     if formatted_timestamp:
-        return f"{base_query} WHERE s.last_updated_ts < '{formatted_timestamp}' ORDER BY s.last_updated_ts ASC"
-    return f"{base_query} ORDER BY s.last_updated_ts ASC"
+        return f"{base_query} WHERE s.last_updated_ts < '{formatted_timestamp}' ORDER BY sm.entity_id ASC, s.last_updated_ts DESC"
+    return f"{base_query} ORDER BY sm.entity_id ASC, s.last_updated_ts DESC"
 
 def parse_attributes(shared_attrs):
     try:
@@ -122,6 +122,24 @@ def parse_attributes(shared_attrs):
     except (TypeError, json.JSONDecodeError) as e:
         logging.warning(f"Failed to parse attributes: {e}")
         return {}
+
+_entity_exists_cache = {}
+
+def check_entity_exists(client, measurement, domain, entity_id_short):
+    if client is None:
+        return True # For dry-run without client, assume exists
+    cache_key = f"{measurement}:{domain}:{entity_id_short}"
+    if cache_key in _entity_exists_cache:
+        return _entity_exists_cache[cache_key]
+    try:
+        query = f'SELECT * FROM "{measurement}" WHERE "domain" = \'{domain}\' AND "entity_id" = \'{entity_id_short}\' LIMIT 1'
+        table = client.query(query=query, language="influxql")
+        exists = table is not None and table.num_rows > 0
+        _entity_exists_cache[cache_key] = exists
+        return exists
+    except Exception as e:
+        logging.warning(f"Error checking entity existence for {cache_key}: {e}")
+        return False
 
 def batch_insert_to_influx(client, rows):
     points = []
@@ -137,6 +155,10 @@ def batch_insert_to_influx(client, rows):
 
         if not unit_of_measurement:
             logging.debug(f"Skipping entity '{entity_id}' — no unit_of_measurement in attributes")
+            continue
+
+        if not check_entity_exists(client, unit_of_measurement, domain, entity_id_short):
+            logging.debug(f"Skipping entity '{entity_id}' — no existing data in table '{unit_of_measurement}'")
             continue
 
         try:
