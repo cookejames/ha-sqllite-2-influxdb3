@@ -195,7 +195,6 @@ def batch_insert_to_influx(client, rows):
                 f"value={state!r} "
                 f"time={last_updated_dt.isoformat()}"
             )
-            logging.debug(point)
 
         except ValueError as e:
             logging.warning(f"Error preparing InfluxDB point for entity {entity_id}: {e}, row: {row}")
@@ -209,15 +208,19 @@ def batch_insert_to_influx(client, rows):
             # Debug mode: write one point at a time for easier error tracing
             for point in points:
                 try:
+                    logging.debug(f"Writing point: {point}")
                     client.write(record=point)
                 except Exception as e:
                     logging.error(f"Error writing point to InfluxDB: {e}. Point: {point}")
+                    raise e
         else:
             try:
+                logging.debug(f"Writing {len(points)} points to InfluxDB")
                 client.write(record=points)
                 logging.info(f"Successfully wrote {len(points)} points to InfluxDB")
             except Exception as e:
                 logging.error(f"Error writing points to InfluxDB: {e}")
+                raise e
     else:
         logging.info("No points to write in this batch.")
 
