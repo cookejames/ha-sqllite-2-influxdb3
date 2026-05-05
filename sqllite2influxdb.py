@@ -157,7 +157,7 @@ def batch_insert_to_influx(client, rows):
             last_updated_dt = datetime.fromtimestamp(float(last_updated_ts), tz=timezone.utc)
             
             # Create an InfluxDB point with tags and fields
-            point = Point(unit_of_measurement).tag("source", "HA").tag("domain", domain)
+            point = Point(unit_of_measurement).tag("source", "states").tag("domain", domain)
             point.tag("entity_id", entity_id_short).time(last_updated_dt)
 
             # Add the state value as either a numerical value or a string
