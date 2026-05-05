@@ -69,17 +69,40 @@ def format_timestamp(oldest_timestamp):
         logging.error(f"Error parsing timestamp: {e}")
         exit(1)
 
-def build_sqlite_query(formatted_timestamp):
-    # Build the SQLite query with an optional timestamp filter
-    base_query = """
+def get_entity_ids(cursor):
+    """Fetch all distinct entity_ids from SQLite."""
+    cursor.execute("SELECT entity_id FROM states_meta")
+    return [row[0] for row in cursor.fetchall()]
+
+def get_entity_uom(cursor, entity_id):
+    """Fetch the unit_of_measurement for an entity_id."""
+    cursor.execute("""
+        SELECT json_extract(sa.shared_attrs, '$.unit_of_measurement')
+        FROM states s
+        JOIN states_meta sm ON sm.metadata_id = s.metadata_id
+        JOIN state_attributes sa ON sa.attributes_id = s.attributes_id
+        WHERE sm.entity_id = ? AND json_extract(sa.shared_attrs, '$.unit_of_measurement') IS NOT NULL
+        LIMIT 1
+    """, (entity_id,))
+    row = cursor.fetchone()
+    return row[0] if row else None
+
+def get_entity_rows(cursor, entity_id, batch_size, oldest_ts):
+    """Yield batches of rows for a specific entity_id that are older than oldest_ts."""
+    query = """
     SELECT s.state, sm.entity_id, s.last_updated_ts, sa.shared_attrs
     FROM states s
     LEFT JOIN state_attributes sa ON sa.attributes_id = s.attributes_id
     JOIN states_meta sm ON sm.metadata_id = s.metadata_id
+    WHERE sm.entity_id = ? AND s.last_updated_ts < ?
+    ORDER BY s.last_updated_ts DESC
     """
-    if formatted_timestamp:
-        return f"{base_query} WHERE s.last_updated_ts < '{formatted_timestamp}' ORDER BY sm.entity_id ASC, s.last_updated_ts DESC"
-    return f"{base_query} ORDER BY sm.entity_id ASC, s.last_updated_ts DESC"
+    cursor.execute(query, (entity_id, oldest_ts.timestamp()))
+    while True:
+        rows = cursor.fetchmany(batch_size)
+        if not rows:
+            break
+        yield rows
 
 def parse_attributes(shared_attrs):
     try:
@@ -129,19 +152,10 @@ def batch_insert_to_influx(client, rows):
             logging.debug(f"Skipping entity '{entity_id}' — no unit_of_measurement in attributes")
             continue
 
-        oldest_ts = get_entity_oldest_timestamp(client, unit_of_measurement, domain, entity_id_short)
-        if oldest_ts is None:
-            logging.debug(f"Skipping entity '{entity_id}' — no existing data in table '{unit_of_measurement}'")
-            continue
-
         try:
             # Convert timestamp from Unix epoch to UTC-aware datetime object
             last_updated_dt = datetime.fromtimestamp(float(last_updated_ts), tz=timezone.utc)
             
-            if last_updated_dt >= oldest_ts:
-                logging.debug(f"Skipping entity '{entity_id}' — sqlite record time ({last_updated_dt.isoformat()}) is not older than InfluxDB oldest record ({oldest_ts.isoformat()})")
-                continue
-
             # Create an InfluxDB point with tags and fields
             point = Point(unit_of_measurement).tag("source", "HA").tag("domain", domain)
             point.tag("entity_id", entity_id_short).time(last_updated_dt)
@@ -212,25 +226,34 @@ def main():
     conn, cursor = connect_to_sqlite(sqlite_db)
     client = connect_to_influxdb(influx_url, influx_token, influx_database)
 
-    # Build the SQLite query (we no longer use a global oldest timestamp)
-    sqlite_query = build_sqlite_query(None)
-    logging.info(f"Final SQLite query: {sqlite_query}")
-
     total_points = 0
     try:
-        # Execute the SQLite query and process rows in batches
-        logging.info("Fetching Data from SQLite.")
-        cursor.execute(sqlite_query)
-        rows_fetched = 0
-        logging.info("Started Processing Data from SQLite.")
-        while True:
-            rows = cursor.fetchmany(BATCH_SIZE)
-            if not rows:
-                break
-            batch_insert_to_influx(client, rows)
-            rows_fetched += len(rows)
-            total_points += len(rows)
-            # logging.info(f"Processed {rows_fetched} rows so far.")
+        logging.info("Fetching entity IDs from SQLite.")
+        entity_ids = get_entity_ids(cursor)
+        logging.info(f"Found {len(entity_ids)} entities in SQLite.")
+
+        entities_to_process = []
+        for entity_id in entity_ids:
+            uom = get_entity_uom(cursor, entity_id)
+            if not uom:
+                continue
+                
+            domain, _, entity_id_short = entity_id.partition('.')
+            oldest_ts = get_entity_oldest_timestamp(client, uom, domain, entity_id_short)
+            
+            if oldest_ts is None:
+                logging.debug(f"Discarding entity '{entity_id}' - no existing records in InfluxDB.")
+                continue
+                
+            entities_to_process.append((entity_id, oldest_ts))
+
+        logging.info(f"Found {len(entities_to_process)} entities with existing InfluxDB records to process.")
+
+        for entity_id, oldest_ts in entities_to_process:
+            logging.info(f"Processing entity: {entity_id}")
+            for rows in get_entity_rows(cursor, entity_id, BATCH_SIZE, oldest_ts):
+                batch_insert_to_influx(client, rows)
+                total_points += len(rows)
     except sqlite3.Error as e:
         logging.error(f"SQLite query error: {e}")
     finally:
