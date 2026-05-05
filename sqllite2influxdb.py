@@ -55,41 +55,7 @@ def connect_to_influxdb(url, token, database):
         logging.error(f"InfluxDB connection error: {e}")
         exit(1)
 
-def get_oldest_influx_timestamp(client):
-    try:
-        # Discover all measurements in the database
-        measurements_table = client.query(query="SHOW MEASUREMENTS", language="influxql")
-        if measurements_table is None or measurements_table.num_rows == 0:
-            logging.info("No measurements found in InfluxDB database.")
-            return None
 
-        # SHOW MEASUREMENTS returns a 'name' column
-        measurement_names = [row.as_py() for row in measurements_table.column("name")]
-        logging.info(f"Found {len(measurement_names)} measurement(s) in InfluxDB: {measurement_names}")
-
-        oldest_ts = None
-        for measurement in measurement_names:
-            try:
-                table = client.query(
-                    query=f'SELECT * FROM "{measurement}" ORDER BY time ASC LIMIT 1',
-                    language="influxql"
-                )
-                if table is not None and table.num_rows > 0:
-                    time_col = table.column("time")
-                    if time_col and len(time_col) > 0:
-                        ts = time_col[0].as_py()
-                        if ts is not None:
-                            if oldest_ts is None or ts < oldest_ts:
-                                oldest_ts = ts
-                                logging.debug(f"New oldest timestamp {ts} from measurement '{measurement}'")
-            except Exception as e:
-                logging.warning(f"Could not query measurement '{measurement}': {e}")
-
-        return oldest_ts.isoformat() if oldest_ts is not None else None
-
-    except Exception as e:
-        logging.error(f"Error querying InfluxDB for the oldest timestamp: {e}")
-    return None
 
 def format_timestamp(oldest_timestamp):
     try:
@@ -103,17 +69,40 @@ def format_timestamp(oldest_timestamp):
         logging.error(f"Error parsing timestamp: {e}")
         exit(1)
 
-def build_sqlite_query(formatted_timestamp):
-    # Build the SQLite query with an optional timestamp filter
-    base_query = """
+def get_entity_ids(cursor):
+    """Fetch all distinct entity_ids from SQLite."""
+    cursor.execute("SELECT entity_id FROM states_meta")
+    return [row[0] for row in cursor.fetchall()]
+
+def get_entity_uom(cursor, entity_id):
+    """Fetch the unit_of_measurement for an entity_id."""
+    cursor.execute("""
+        SELECT json_extract(sa.shared_attrs, '$.unit_of_measurement')
+        FROM states s
+        JOIN states_meta sm ON sm.metadata_id = s.metadata_id
+        JOIN state_attributes sa ON sa.attributes_id = s.attributes_id
+        WHERE sm.entity_id = ? AND json_extract(sa.shared_attrs, '$.unit_of_measurement') IS NOT NULL
+        LIMIT 1
+    """, (entity_id,))
+    row = cursor.fetchone()
+    return row[0] if row else None
+
+def get_entity_rows(cursor, entity_id, batch_size, oldest_ts):
+    """Yield batches of rows for a specific entity_id that are older than oldest_ts."""
+    query = """
     SELECT s.state, sm.entity_id, s.last_updated_ts, sa.shared_attrs
     FROM states s
     LEFT JOIN state_attributes sa ON sa.attributes_id = s.attributes_id
     JOIN states_meta sm ON sm.metadata_id = s.metadata_id
+    WHERE sm.entity_id = ? AND s.last_updated_ts < ?
+    ORDER BY s.last_updated_ts DESC
     """
-    if formatted_timestamp:
-        return f"{base_query} WHERE s.last_updated_ts < '{formatted_timestamp}' ORDER BY s.last_updated_ts ASC"
-    return f"{base_query} ORDER BY s.last_updated_ts ASC"
+    cursor.execute(query, (entity_id, oldest_ts.timestamp()))
+    while True:
+        rows = cursor.fetchmany(batch_size)
+        if not rows:
+            break
+        yield rows
 
 def parse_attributes(shared_attrs):
     try:
@@ -122,6 +111,30 @@ def parse_attributes(shared_attrs):
     except (TypeError, json.JSONDecodeError) as e:
         logging.warning(f"Failed to parse attributes: {e}")
         return {}
+
+_entity_oldest_ts_cache = {}
+
+def get_entity_oldest_timestamp(client, measurement, domain, entity_id_short):
+    if client is None:
+        return datetime.now(timezone.utc) # For dry-run without client, assume very new to allow insert
+    cache_key = f"{measurement}:{domain}:{entity_id_short}"
+    if cache_key in _entity_oldest_ts_cache:
+        return _entity_oldest_ts_cache[cache_key]
+    try:
+        query = f'SELECT * FROM "{measurement}" WHERE "domain" = \'{domain}\' AND "entity_id" = \'{entity_id_short}\' ORDER BY time ASC LIMIT 1'
+        table = client.query(query=query, language="influxql")
+        if table is not None and table.num_rows > 0:
+            time_col = table.column("time")
+            if time_col and len(time_col) > 0:
+                ts = time_col[0].as_py()
+                _entity_oldest_ts_cache[cache_key] = ts
+                return ts
+        _entity_oldest_ts_cache[cache_key] = None
+        return None
+    except Exception as e:
+        logging.warning(f"Error checking entity oldest timestamp for {cache_key}: {e}")
+        _entity_oldest_ts_cache[cache_key] = None
+        return None
 
 def batch_insert_to_influx(client, rows):
     points = []
@@ -133,38 +146,55 @@ def batch_insert_to_influx(client, rows):
         attributes_json = parse_attributes(shared_attrs)
 
         friendly_name = attributes_json.get('friendly_name', entity_id_short)
-        unit_of_measurement = attributes_json.get('unit_of_measurement', 'default_measurement')
+        unit_of_measurement = attributes_json.get('unit_of_measurement')
 
-        if unit_of_measurement == '':
-            unit_of_measurement = 'count'
+        if not unit_of_measurement:
+            logging.debug(f"Skipping entity '{entity_id}' — no unit_of_measurement in attributes")
+            continue
+
         try:
             # Convert timestamp from Unix epoch to UTC-aware datetime object
             last_updated_dt = datetime.fromtimestamp(float(last_updated_ts), tz=timezone.utc)
+            
             # Create an InfluxDB point with tags and fields
             point = Point(unit_of_measurement).tag("source", "HA").tag("domain", domain)
-            point.tag("entity_id", entity_id_short).tag("friendly_name", friendly_name).time(last_updated_dt)
+            point.tag("entity_id", entity_id_short).time(last_updated_dt)
 
             # Add the state value as either a numerical value or a string
-            if isinstance(state, (int, float)) or (isinstance(state, str) and state.replace('.', '', 1).isdigit()):
-                point.field("value", float(state))
-            else:
+            try:
+                # Attempt to convert state to a float.
+                val = float(state)
+                point.field("value", val)
+            except (ValueError, TypeError):
+                # If it's not a number (ValueError) or not a string/number (TypeError),
+                # we treat it as a string state.
                 point.field("state", str(state))
 
             # Add additional attributes as fields, ensuring correct type
             for key, value in attributes_json.items():
-                if key in ["id", "id_str", "update_available"]:
+                if key in ["id", "id_str", "update_available", "entity_id", "icon", "last_reset"]:
+                    continue
+                if value is None:
                     continue
                 try:
                     if key in ["temperature", "humidity", "voc", "formaldehyd", "co2", "linkquality"]:
                         point.field(key, float(value))
                     elif isinstance(value, (int, float)) or (isinstance(value, str) and value.replace('.', '', 1).isdigit()):
                         point.field(key, float(value))
+                    elif isinstance(value, str):
+                        point.field(f"{key}_str", str(value))
                     else:
                         point.field(f"{key}", str(value))
                 except Exception as e:
                     logging.warning(f"Skipping field '{key}' for entity '{entity_id}' with value '{value}' due to type conflict: {e}")
 
             points.append(point)
+            logging.debug(
+                f"Queued point → table='{unit_of_measurement}' "
+                f"entity='{entity_id}' "
+                f"value={state!r} "
+                f"time={last_updated_dt.isoformat()}"
+            )
 
         except ValueError as e:
             logging.warning(f"Error preparing InfluxDB point for entity {entity_id}: {e}, row: {row}")
@@ -178,15 +208,19 @@ def batch_insert_to_influx(client, rows):
             # Debug mode: write one point at a time for easier error tracing
             for point in points:
                 try:
+                    logging.debug(f"Writing point: {point}")
                     client.write(record=point)
                 except Exception as e:
                     logging.error(f"Error writing point to InfluxDB: {e}. Point: {point}")
+                    raise e
         else:
             try:
+                logging.debug(f"Writing {len(points)} points to InfluxDB")
                 client.write(record=points)
                 logging.info(f"Successfully wrote {len(points)} points to InfluxDB")
             except Exception as e:
                 logging.error(f"Error writing points to InfluxDB: {e}")
+                raise e
     else:
         logging.info("No points to write in this batch.")
 
@@ -195,30 +229,34 @@ def main():
     conn, cursor = connect_to_sqlite(sqlite_db)
     client = connect_to_influxdb(influx_url, influx_token, influx_database)
 
-    # Get the oldest timestamp from InfluxDB to determine how much data to process
-    oldest_influx_timestamp = get_oldest_influx_timestamp(client)
-    logging.info(f"Oldest InfluxDB timestamp: {oldest_influx_timestamp}")
-
-    # Format the timestamp for SQLite and build the query
-    formatted_timestamp = format_timestamp(oldest_influx_timestamp) if oldest_influx_timestamp else None
-    sqlite_query = build_sqlite_query(formatted_timestamp)
-    logging.info(f"Final SQLite query: {sqlite_query}")
-
     total_points = 0
     try:
-        # Execute the SQLite query and process rows in batches
-        logging.info("Fetching Data from SQLite.")
-        cursor.execute(sqlite_query)
-        rows_fetched = 0
-        logging.info("Started Processing Data from SQLite.")
-        while True:
-            rows = cursor.fetchmany(BATCH_SIZE)
-            if not rows:
-                break
-            batch_insert_to_influx(client, rows)
-            rows_fetched += len(rows)
-            total_points += len(rows)
-            # logging.info(f"Processed {rows_fetched} rows so far.")
+        logging.info("Fetching entity IDs from SQLite.")
+        entity_ids = get_entity_ids(cursor)
+        logging.info(f"Found {len(entity_ids)} entities in SQLite.")
+
+        entities_to_process = []
+        for entity_id in entity_ids:
+            uom = get_entity_uom(cursor, entity_id)
+            if not uom:
+                continue
+                
+            domain, _, entity_id_short = entity_id.partition('.')
+            oldest_ts = get_entity_oldest_timestamp(client, uom, domain, entity_id_short)
+            
+            if oldest_ts is None:
+                logging.debug(f"Discarding entity '{entity_id}' - no existing records in InfluxDB.")
+                continue
+                
+            entities_to_process.append((entity_id, oldest_ts))
+
+        logging.info(f"Found {len(entities_to_process)} entities with existing InfluxDB records to process.")
+
+        for entity_id, oldest_ts in entities_to_process:
+            logging.info(f"Processing entity: {entity_id}")
+            for rows in get_entity_rows(cursor, entity_id, BATCH_SIZE, oldest_ts):
+                batch_insert_to_influx(client, rows)
+                total_points += len(rows)
     except sqlite3.Error as e:
         logging.error(f"SQLite query error: {e}")
     finally:
