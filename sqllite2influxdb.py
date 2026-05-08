@@ -108,8 +108,8 @@ def get_entity_rows(cursor, entity_id, batch_size, oldest_ts):
             break
         yield rows
 
-def get_entity_statistics_rows(cursor, entity_id, batch_size, oldest_ts):
-    """Yield batches of statistics rows for a specific entity_id that are older than oldest_ts."""
+def get_entity_statistics_rows(cursor, entity_id, batch_size, before_state_ts):
+    """Yield statistics rows with start_ts strictly before before_state_ts (older than imported state samples)."""
     query = """
     SELECT s.start_ts, s.mean, s.min, s.max, s.state, s.sum
     FROM statistics s
@@ -117,7 +117,7 @@ def get_entity_statistics_rows(cursor, entity_id, batch_size, oldest_ts):
     WHERE sm.statistic_id = ? AND s.start_ts < ?
     ORDER BY s.start_ts DESC
     """
-    cursor.execute(query, (entity_id, oldest_ts.timestamp()))
+    cursor.execute(query, (entity_id, float(before_state_ts)))
     while True:
         rows = cursor.fetchmany(batch_size)
         if not rows:
@@ -330,19 +330,27 @@ def main():
         for entity_id, uom, oldest_ts in entities_to_process:
             logging.info(f"Processing entity states: {entity_id}")
             entity_states_points = 0
+            min_state_ts = None
             for rows in get_entity_rows(cursor, entity_id, BATCH_SIZE, oldest_ts):
                 batch_insert_to_influx(client, rows)
                 entity_states_points += len(rows)
+                batch_min_ts = min(row[2] for row in rows)
+                min_state_ts = batch_min_ts if min_state_ts is None else min(min_state_ts, batch_min_ts)
             total_states_points += entity_states_points
             
             if IMPORT_STATISTICS_DATA:
+                statistics_before_ts = (
+                    min_state_ts if min_state_ts is not None else oldest_ts.timestamp()
+                )
                 logging.info(f"Processing entity statistics: {entity_id}")
                 entity_statistics_points = 0
-                for rows in get_entity_statistics_rows(cursor, entity_id, BATCH_SIZE, oldest_ts):
+                for rows in get_entity_statistics_rows(cursor, entity_id, BATCH_SIZE, statistics_before_ts):
                     batch_insert_statistics_to_influx(client, rows, entity_id, uom)
                     entity_statistics_points += len(rows)
                 total_statistics_points += entity_statistics_points
-                logging.info(f"Finished '{entity_id}' — States: {entity_states_points}, Statistics: {entity_statistics_points}")
+                logging.info(
+                    f"Finished '{entity_id}' — States: {entity_states_points}, Statistics: {entity_statistics_points}"
+                )
             else:
                 logging.info(f"Finished '{entity_id}' — States: {entity_states_points}")
 
